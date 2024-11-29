@@ -1,0 +1,10 @@
+{
+	"TotalSolarEclipse": 0, 
+	"0to25percentPartialEclipse": 1, 
+	"26to55percentPartialEclipse": 2, 
+	"56to95percentPartialEclipse": 3, 
+	"Darks": 4, 
+	"DiamondRing_BaileysBeads_SolarEclipse": 5, 
+	"Flats": 6, 
+	"NotASolarEclipse": 7
+}
