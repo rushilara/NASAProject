@@ -7,12 +7,13 @@ import cv2
 import math
 import os
 import pandas as pd
+import numpy as np
 
 # Pretrained model path
-MODEL_PATH = "./models/940_efficientnet_b1_20241126-212325.pth"
+MODEL_PATH = "./models/best_model.pth"  # Update with your actual model path
 
 # Test directory and output CSV
-TEST_DIR = "../images/test"
+TEST_DIR = "../images/test"  # Update if necessary
 OUTPUT_CSV = "predictions_with_debug.csv"
 DEBUG_IMAGES_DIR = "./debug_circles"  # Directory to save debug images
 
@@ -45,8 +46,9 @@ def predict_class(image_path, model):
     input_tensor = preprocess(image).unsqueeze(0)  # Add batch dimension
     with torch.no_grad():
         output = model(input_tensor)
-    predicted_class = torch.argmax(output).item()
-    return predicted_class
+        probabilities = torch.nn.functional.softmax(output, dim=1)
+        confidence, predicted_class = torch.max(probabilities, 1)
+    return predicted_class.item(), confidence.item()
 
 # Circle overlap calculation
 def calculate_overlap(r1, r2, d):
@@ -64,64 +66,70 @@ def calculate_overlap(r1, r2, d):
 def classify_partial_eclipse(image, image_path=None, output_debug_dir=DEBUG_IMAGES_DIR):
     os.makedirs(output_debug_dir, exist_ok=True)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray_blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    gray_blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Edge detection
+    edges = cv2.Canny(gray_blurred, 50, 150)
 
     # Detect circles using HoughCircles
     circles = cv2.HoughCircles(
-        gray_blurred,
+        edges,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=50,
-        param1=100,
+        minDist=30,
+        param1=50,
         param2=30,
-        minRadius=50,
-        maxRadius=300
+        minRadius=30,
+        maxRadius=150
     )
 
     # Debug: Save image with detected circles
     if circles is not None:
+        circles = np.uint16(np.around(circles))
         confidence_scores = []
+        radii = []
         for circle in circles[0, :]:
-            center = (int(circle[0]), int(circle[1]))
-            radius = int(circle[2])
-            confidence_scores.append(radius / 300)  # Normalize confidence score
-            cv2.circle(image, center, radius, (0, 255, 0), 2)  # Draw circle
-            cv2.circle(image, center, 2, (255, 0, 0), 3)  # Draw center
+            x, y, r = circle
+            radii.append(r)
+            # No direct confidence score from HoughCircles, so we can use the circle radius as a proxy
+            # Alternatively, we can assume detection is confident if circles are detected
+            cv2.circle(image, (x, y), r, (0, 255, 0), 2)  # Draw circle
+            cv2.circle(image, (x, y), 2, (255, 0, 0), 3)  # Draw center
 
         # Save debug image
         debug_path = os.path.join(output_debug_dir, os.path.basename(image_path))
         cv2.imwrite(debug_path, image)
 
-        # Check confidence threshold
-        avg_confidence = sum(confidence_scores) / len(confidence_scores)
-        if avg_confidence < MIN_CONFIDENCE_THRESHOLD:
-            return None  # Insufficient confidence, do not refine
+        # Proceed only if at least two circles are detected
+        if len(circles[0]) >= 2:
+            # Assume the largest circle is the sun, the next largest is the moon
+            sorted_circles = sorted(circles[0], key=lambda x: x[2], reverse=True)
+            x1, y1, r1 = sorted_circles[0]
+            x2, y2, r2 = sorted_circles[1]
+            d = math.hypot(x1 - x2, y1 - y2)
+            overlap_area = calculate_overlap(r1, r2, d)
+            sun_area = math.pi * r1**2
+            coverage_percentage = (overlap_area / sun_area) * 100
 
-    # Ensure at least 2 circles are detected
-    if circles is not None and len(circles[0]) >= 2:
-        x1, y1, r1 = circles[0][0]
-        x2, y2, r2 = circles[0][1]
-        d = math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-        overlap_area = calculate_overlap(r1, r2, d)
-        sun_area = math.pi * r1**2
-        coverage_percentage = (overlap_area / sun_area) * 100
-
-        # Return bin based on coverage percentage
-        if coverage_percentage <= 25:
-            return 1
-        elif 26 <= coverage_percentage <= 55:
-            return 2
-        elif 56 <= coverage_percentage <= 99:
-            return 3
-    return None
+            # Return bin based on coverage percentage
+            if coverage_percentage <= 25:
+                return 1  # Bin for 0-25%
+            elif 25 < coverage_percentage <= 55:
+                return 2  # Bin for 26-55%
+            elif 55 < coverage_percentage <= 95:
+                return 3  # Bin for 56-95%
+    return None  # Return None if verification is not possible
 
 # Hybrid classifier
 def hybrid_classifier(image_path, model):
-    predicted_class = predict_class(image_path, model)
+    predicted_class, model_confidence = predict_class(image_path, model)
 
-    # Refine classification for ambiguous bins (0-95% partial eclipse)
-    if predicted_class in [1, 2, 3]:  # 0-25%, 26-55%, 56-99%
+    # Only proceed if model confidence is below a threshold and predicted class is in bins 1-3
+    if predicted_class in [1, 2, 3] and model_confidence < 0.9:
         raw_image = cv2.imread(image_path)
+        if raw_image is None:
+            print(f"Error loading image {image_path}")
+            return predicted_class  # Return original prediction
         refined_class = classify_partial_eclipse(raw_image, image_path)
         if refined_class is not None:
             return refined_class
@@ -145,3 +153,4 @@ def generate_predictions(test_dir, model, output_csv, debug_dir=DEBUG_IMAGES_DIR
 # Run the pipeline
 if __name__ == "__main__":
     generate_predictions(TEST_DIR, model, OUTPUT_CSV)
+
