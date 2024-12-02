@@ -1,101 +1,126 @@
+import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import Adam
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
 from efficientnet_pytorch import EfficientNet
-import os
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import DataLoader, random_split
 
-# Paths
-DATASET_PATH = "../images/augmented_2000"
-MODEL_SAVE_PATH = "./models/efficientnet_b2_augmented_2000.pth"
-CHECKPOINT_DIR = "./models/checkpoints"
-BATCH_SIZE = 16
-EPOCHS = 25
-LEARNING_RATE = 1e-4
-NUM_CLASSES = 8  # Number of classes
-
-# Device configuration
+# Configuration
+data_dir = "../images/new_augmented_training_set"  # Dataset directory
+model_save_path = "./models/v2_efficientnet_b2_finetuned.pth"
+batch_size = 16
+learning_rate = 1e-4
+weight_decay = 1e-5  # L2 regularization
+dropout_rate = 0.3
+num_classes = 8
+epochs = 25
+patience = 5  # Early stopping patience
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
-# Ensure directories exist
-if not os.path.exists(CHECKPOINT_DIR):
-    os.makedirs(CHECKPOINT_DIR)
-if not os.path.exists(os.path.dirname(MODEL_SAVE_PATH)):
-    os.makedirs(os.path.dirname(MODEL_SAVE_PATH))
-
-# Ensure dataset exists
-if not os.path.exists(DATASET_PATH):
-    raise FileNotFoundError(f"Dataset directory '{DATASET_PATH}' not found. Please check the path.")
-
-# Data transforms
-train_transforms = transforms.Compose([
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(30),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+# Data transformations
+transform = transforms.Compose([
     transforms.Resize((300, 300)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# Load dataset
-dataset = datasets.ImageFolder(DATASET_PATH, transform=train_transforms)
-train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-print(f"Loaded dataset with {len(dataset)} images.")
+# Dataset and DataLoader
+dataset = datasets.ImageFolder(root=data_dir, transform=transform)
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-# Initialize EfficientNet-B2 model
-model = EfficientNet.from_name('efficientnet-b2')
-model._fc = nn.Linear(model._fc.in_features, NUM_CLASSES)  # Adjust output layer
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+print(f"Training on {len(train_dataset)} images, validating on {len(val_dataset)} images.")
+
+# Load EfficientNet-B2 with pretrained weights
+model = EfficientNet.from_pretrained('efficientnet-b2')
+print("EfficientNet-B2 pretrained weights loaded successfully.")
+
+# Modify the model for fine-tuning
+num_features = model._fc.in_features
+model._fc = nn.Sequential(
+    nn.Dropout(p=dropout_rate),
+    nn.Linear(num_features, num_classes)
+)
 model = model.to(device)
+
+# Freeze BatchNorm layers to stabilize training
+for module in model.modules():
+    if isinstance(module, nn.BatchNorm2d):
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
 
 # Loss function and optimizer
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-# Training loop with checkpointing
-def train_model(model, dataloader, criterion, optimizer, epochs, save_path, checkpoint_dir):
+# Learning rate scheduler
+scheduler = StepLR(optimizer, step_size=5, gamma=0.8)
+
+# Early stopping variables
+best_val_loss = float('inf')
+early_stopping_counter = 0
+
+# Training and validation loop
+for epoch in range(epochs):
+    print(f"Epoch [{epoch + 1}/{epochs}]")
+    
+    # Training
     model.train()
-    for epoch in range(epochs):
-        print(f"Epoch [{epoch + 1}/{epochs}]")  # Print the epoch number first
-        total_loss = 0
-        correct = 0
-        total = 0
+    train_loss, correct = 0, 0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        train_loss += loss.item()
+        correct += (outputs.argmax(1) == labels).sum().item()
 
-        for batch_idx, (inputs, targets) in enumerate(dataloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            # Forward pass
+    train_loss /= len(train_loader)
+    train_accuracy = correct / len(train_dataset)
+    
+    # Validation
+    model.eval()
+    val_loss, val_correct = 0, 0
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            val_loss += criterion(outputs, labels).item()
+            val_correct += (outputs.argmax(1) == labels).sum().item()
 
-            # Backward pass and optimization
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    val_loss /= len(val_loader)
+    val_accuracy = val_correct / len(val_dataset)
+    
+    # Print results for this epoch
+    print(f"Train Loss: {train_loss:.4f}, Accuracy: {train_accuracy:.4f}")
+    print(f"Val Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
 
-            # Track accuracy and loss
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+    # Learning rate scheduling
+    scheduler.step()
 
-        # Epoch stats
-        epoch_loss = total_loss / len(dataloader)
-        epoch_acc = 100. * correct / total
-        print(f"Epoch [{epoch + 1}/{epochs}] - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+    # Early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        early_stopping_counter = 0
+        # Save the best model
+        torch.save(model.state_dict(), model_save_path)
+        print(f"Model improved. Saved to {model_save_path}")
+    else:
+        early_stopping_counter += 1
+        print(f"No improvement in validation loss. Early stopping counter: {early_stopping_counter}/{patience}")
+        if early_stopping_counter >= patience:
+            print("Early stopping triggered. Stopping training.")
+            break
 
-        # Save checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == epochs:
-            checkpoint_path = os.path.join(checkpoint_dir, f"efficientnet_b2_epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
-
-    # Final model save
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-# Train and save the model
-if __name__ == "__main__":
-    train_model(model, train_loader, criterion, optimizer, EPOCHS, MODEL_SAVE_PATH, CHECKPOINT_DIR)
+print("Training complete.")
